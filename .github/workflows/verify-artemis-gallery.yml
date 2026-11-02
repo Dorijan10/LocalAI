@@ -1,0 +1,70 @@
+name: 'verify artemis gallery entries'
+
+# Fork-only check for mudler/LocalAI#12928 and #12937: the model-library.yml
+# and yaml-check.yml commands on master with both PRs merged, and every
+# TurinTech file checked against Hugging Face.
+
+on:
+  push:
+    branches: ['verify/artemis-gallery']
+
+permissions:
+  contents: read
+
+jobs:
+  model-library:
+    name: 'Model library and yamllint (model-library.yml, yaml-check.yml)'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generate the gRPC stubs the Go packages import
+        run: |
+          curl -L -s https://github.com/protocolbuffers/protobuf/releases/download/v26.1/protoc-26.1-linux-x86_64.zip -o protoc.zip
+          sudo unzip -j -d /usr/local/bin protoc.zip bin/protoc
+          rm protoc.zip
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@1958fcbe2ca8bd93af633f11e97d44e567e945af
+          PATH="$PATH:$HOME/go/bin" make protogen-go
+      - name: Test the library, the generator and the gallery copy
+        run: |
+          go test ./scripts/models/...
+          go test ./core/gallery -run 'TestModelLibrary|TestRealModelLibraryHasTheLibraryShape|TestGeneratedGalleryLoadsWithTheSameEntries|TestCheckedInGalleryIsTheGeneratedCopy|TestDecodeModelIndex'
+          go test ./core/gallery -run TestGallery -ginkgo.focus='gallery/index.yaml|gallery variant lint helpers' -count=1
+      - name: Check that the gallery copy is the generated copy of the library
+        run: |
+          go run ./scripts/models/cmd/modelcatalog --library gallery/models/index.yaml --out gallery/index.yaml
+          git diff --exit-code -- gallery/index.yaml
+      - name: Yamllint the model gallery (no new errors against current master)
+        run: |
+          pip install yamllint
+          git fetch --no-tags --depth 1 https://github.com/mudler/LocalAI.git master
+          mkdir -p /tmp/base
+          git archive FETCH_HEAD gallery .yamllint | tar -x -C /tmp/base
+          base=$(cd /tmp/base && yamllint -c .yamllint -f parsable gallery | grep -c '\[error\]' || true)
+          head=$(yamllint -c .yamllint -f parsable gallery | grep -c '\[error\]' || true)
+          echo "yamllint errors: master=$base this branch=$head"
+          test "$head" -le "$base"
+
+  artifacts:
+    name: 'Artifact verification against Hugging Face'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the checker dependencies
+        run: pip install huggingface_hub requests pyyaml
+      - name: Verify every TurinTech file in the model library
+        run: python .github/verify-artemis-artifacts.py gallery/models/index.yaml
